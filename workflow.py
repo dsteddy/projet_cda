@@ -6,6 +6,9 @@ from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 
+dotenv_path = '/mongodb/.env'
+load_dotenv(dotenv_path=dotenv_path)
+
 @task
 def run_scraper(
     job_title: str = "data",
@@ -40,26 +43,33 @@ def api_request(
         print(f"Error decoding JSON: {e}")
 
 @task
-def clean_data(job: dict) -> dict[str, str | float]:
+def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
     """Clean the job offer."""
     cleaner = Cleaner(job)
     cleaned_job = cleaner.clean_full()
     return cleaned_job
 
 @task
-def insert_data(data: dict[str, str | float]) -> None:
+def insert_data(data: list[dict[str, str | float]]) -> None:
     username = os.getenv('MONGO_INITDB_ROOT_USERNAME')
     password = os.getenv('MONGO_INITDB_ROOT_PASSWORD')
     host = 'localhost'
     port = 27017
 
-    client = MongoClient(f'mongodb://{username}:{password}@{host}:{port}/')
+    if not username or not password:
+        raise ValueError("MongoDB credentials are not set in environment variables.")
 
-    db = client.my_database
-    collection = db.my_collection
+    try:
+        client = MongoClient(f'mongodb://{username}:{password}@{host}:{port}/?authSource=admin')
 
-    result = collection.insert_many(data)
-    print(f"Data inserted with id: {result.inserted_id}")
+        db = client.offers
+        collection = db.offers
+
+        result = collection.insert_many(data)
+        # print(f"Data inserted with id: {result.inserted_id}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 @flow(name="Scrape Job Offers", log_prints=True)
 def scrap_job_offers(
@@ -71,7 +81,7 @@ def scrap_job_offers(
     result = []
 
     if api_links:
-        for link in api_links:
+        for link in api_links[:2]:
             offer_info = api_request(link)
             if offer_info:
                 cleaned_offer_info = clean_data(offer_info)
@@ -81,6 +91,9 @@ def scrap_job_offers(
 
     with open("offers.json", "w", encoding="utf-8") as file:
         json.dump(result, file, ensure_ascii=False, indent=2)
+
+    insert_data(result)
+
 
 if __name__ == "__main__":
     scrap_job_offers(max_pages=1)

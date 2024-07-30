@@ -2,3 +2,5 @@
 offers.json
 
 .venv/
+
+/js_scripts/node_modules

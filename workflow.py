@@ -7,13 +7,15 @@ import os
 import pickle
 from dotenv import load_dotenv
 import asyncio
-import time
+from tqdm.asyncio import tqdm
+import timeit
 
 dotenv_path = './mongodb/.env'
 load_dotenv(dotenv_path=dotenv_path)
 
 # Load MongoDB credentials from environment
 def get_db_connection():
+    """Retrieve login credentials from .env file and create connection to offers table from MongoDB."""
     username = os.getenv('MONGO_INITDB_ROOT_USERNAME')
     password = os.getenv('MONGO_INITDB_ROOT_PASSWORD')
     host = os.getenv('MONGO_HOST')
@@ -31,7 +33,7 @@ def get_db_connection():
 # Scrap offers from wttj
 @task
 def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
-    """Execute the js script to scrap job offers from wttj and return api links."""
+    """Execute js script to scrap job offers from wttj and return a list api links."""
     command = ["node", "js_scripts/scrap.js", job_title, str(max_pages)]
 
     try:
@@ -47,10 +49,12 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
 # Get info from scraped offers
 @task
 def api_requests(api_links: list[str]):
+    """Start api request for all api links and return job offers data"""
     result = asyncio.run(fetch_all(api_links))
     return result
 
 async def fetch(command: list[str]) -> dict[str, str | float]:
+    """Individual task to start api request from js script for one job offer"""
     while True:
         try:
             result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
@@ -60,29 +64,30 @@ async def fetch(command: list[str]) -> dict[str, str | float]:
             print(f"Error running the script: {e.stderr}")
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON: {e}")
-        except:
-            print("API Limit reached!")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
             asyncio.sleep(30)
 
 async def fetch_all(api_links: list[str]) -> list[dict[str, str | float]]:
+    """List the tasks and gather the results to request api data from all the links in api_links list"""
     tasks = []
     for link in api_links:
         command = ["node", "js_scripts/api_request.js", link]
         task = asyncio.create_task(fetch(command))
         tasks.append(task)
         await asyncio.sleep(0.07)
-    responses = await asyncio.gather(*tasks)
+    responses = []
+    with tqdm(total=len(tasks), desc="Fetching API data") as pbar:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            responses.append(result)
+            pbar.update(1)
+
     return responses
 
 # Clean info from offers
 @task
 def clean(jobs):
-    # result = []
-    # for job in jobs:
-    #     cleaner = Cleaner(job)
-    #     cleaned_job = cleaner.clean_full()
-    #     result.append(cleaned_job)
-    # return result
     cleaned_result = asyncio.run(clean_all(jobs))
     return cleaned_result
 
@@ -92,6 +97,7 @@ async def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
     return cleaner.clean_full()
 
 async def clean_all(job_offers: list[dict[str, str | float]]) -> list[dict[str, str | float]]:
+    """List the tasks and gather the results to clean all job offers from the job_offers list"""
     tasks = []
     for offer in job_offers:
         task = asyncio.create_task(clean_data(offer))
@@ -102,6 +108,7 @@ async def clean_all(job_offers: list[dict[str, str | float]]) -> list[dict[str, 
 # Insert Data in MongoDB
 @task
 def insert_data(data: list[dict[str, str | float]], collection):
+    """Insert/update data in MongoDB table"""
     try:
         for offer in data:
             existing_id = collection.find_one({'id': offer['id']})
@@ -121,10 +128,12 @@ def insert_data(data: list[dict[str, str | float]], collection):
         print(f"An error occured: {e}")
 
 def save_cache(data, filename):
+    """save list of id from MongoDB table in pkl file"""
     with open(filename, 'wb') as file:
         pickle.dump(data, file)
 
 def load_cache(filename):
+    """load list of id from MongoDB table in pkl file"""
     if os.path.exists(filename):
         with open(filename, 'rb') as file:
             return pickle.load(file)
@@ -132,6 +141,7 @@ def load_cache(filename):
 # Retrieve all IDs from MongoDB
 @task
 def get_all_db_ids(collection) -> set[str]:
+    """Retrieve all id from pkl file or directly from MongoDB table ir pkl file doesn't exist"""
     cache_filename = 'db_ids_cache.pkl'
     cached_ids = load_cache(cache_filename)
     if cached_ids:
@@ -145,6 +155,7 @@ def get_all_db_ids(collection) -> set[str]:
 # Remove offers that are not valid anymore
 @task
 def remove_old_offers(ids_to_del: set[str], collection):
+    """Remove offers that are not available anymore"""
     try:
         result = collection.delete_many({'id': {'$in': list(ids_to_del)}})
         print(f'Deleted {result.deleted_count} offers.')
@@ -153,7 +164,8 @@ def remove_old_offers(ids_to_del: set[str], collection):
 
 @flow(name="Scrap Job Offers", log_prints=True)
 def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
-    start_time = time.time()
+    start_time = timeit.default_timer()
+
     api_links = run_scraper(job_title, max_pages)
 
     if api_links:
@@ -171,8 +183,11 @@ def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
         insert_data(cleaned_result, collection)
         ids_to_del = db_ids - api_ids
         remove_old_offers(ids_to_del, collection)
-    end_time = time.time()
-    print(f'Time : {end_time - start_time:.2f}')
+
+    end_time = timeit.default_timer()
+    elapsed_time = end_time - start_time
+    time_unit = "seconds" if elapsed_time < 60 else "minutes"
+    print(f'Time: {elapsed_time:.2f} {time_unit}')
 
 if __name__ == "__main__":
     scrap_job_offers(max_pages=1)

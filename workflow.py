@@ -1,5 +1,6 @@
 from prefect import flow, task
 import asyncio
+import aiohttp
 import subprocess
 import json
 from cleaner import Cleaner
@@ -35,7 +36,6 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
 
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
-        print(result.stdout[:10])
         output = json.loads(result.stdout)
         return output
     except subprocess.CalledProcessError as e:
@@ -44,26 +44,38 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
         print(f"Error decoding JSON: {e}")
 
 # Get info from scraped offers
-@task
-def api_request(link: str) -> dict[str, str | float]:
-    """Get job offer info from API."""
-    command = ["node", "js_scripts/api_request.js", link]
+async def fetch(session, link):
+    while True:
+        try:
+            async with session.get(link) as response:
+                if response.status == 429:
+                    print('API Limit reached!')
+                    await asyncio.sleep(30)
+                    continue
+                return await response.json()
+        except:
+            await asyncio.sleep(30)
 
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
-        output = json.loads(result.stdout)
-        return output
-    except subprocess.CalledProcessError as e:
-        print(f"Error running the script: {e.stderr}")
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON: {e}")
-
-# Clean info from offers
-@task
-def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
-    """Clean the job offer."""
-    cleaner = Cleaner(job)
+async def clean_data(offer_info: dict):
+    cleaner = Cleaner(offer_info)
     return cleaner.clean_full()
+
+async def fetch_all(api_links: list[str]):
+    tasks = []
+    async with aiohttp.ClientSession() as session:
+        for link in api_links:
+            task = asyncio.create_task(fetch(session, link))
+            tasks.append(task)
+            await asyncio.sleep(0.07)
+
+        responses = await asyncio.gather(*tasks)
+
+        cleaned_results = []
+        for response in responses:
+            cleaned_data = await clean_data(response)
+            cleaned_results.append(cleaned_data)
+
+    return cleaned_results
 
 # Insert Data in MongoDB
 @task
@@ -117,28 +129,17 @@ def remove_old_offers(ids_to_del: set[str], collection):
     except errors.PyMongoError as e:
         print(f'An error occurred: {e}')
 
-@flow(
-        name="Scrape Job Offers",
-        log_prints=True,
-        # schedule=IntervalSchedule(interval=timedelta(minutes=30))
-        )
+@flow(name="Scrape Job Offers", log_prints=True)
 def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
-    api_links = run_scraper(job_title, max_pages).result()
-    result = []
+    api_links = run_scraper(job_title, max_pages)
 
-    if api_links:
-        for link in api_links:
-            offer_info = api_request(link).result()
-            if offer_info:
-                cleaned_offer_info = clean_data(offer_info).result()
-                result.append(cleaned_offer_info)
-            else:
-                print(f"Failed to fetch offer details for link: {link}")
+    result = asyncio.run(fetch_all(api_links))
+
     api_ids = {offer['id'] for offer in result}
     if db_ids:
         db_ids += api_ids
     else:
-        db_ids = get_all_db_ids(collection).result()
+        db_ids = get_all_db_ids(collection)
         db_ids += api_ids
 
     collection = get_db_connection()

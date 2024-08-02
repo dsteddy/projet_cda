@@ -7,7 +7,7 @@ import os
 import pickle
 from dotenv import load_dotenv
 import asyncio
-import aiohttp
+import time
 
 dotenv_path = './mongodb/.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -45,30 +45,10 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
         print(f"Error decoding JSON: {e}")
 
 # Get info from scraped offers
-# @task
-# def api_request(link: str) -> dict[str, str | float]:
-#     """Get job offer info from API."""
-#     command = ["node", "js_scripts/api_request.js", link]
-
-#     try:
-#         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
-#         output = json.loads(result.stdout)
-#         return output
-#     except subprocess.CalledProcessError as e:
-#         print(f"Error running the script: {e.stderr}")
-#     except json.JSONDecodeError as e:
-#         print(f"Error decoding JSON: {e}")
-
-async def fetch_all(api_links: list[str]) -> list[dict[str, str | float]]:
-    tasks = []
-    for link in api_links:
-        command = ["node", "js_scripts/api_request.js", link]
-        task = asyncio.create_task(fetch(command))
-        tasks.append(task)
-        await asyncio.sleep(0.07)
-        responses = await asyncio.gather(*tasks)
-    return responses
-
+@task
+def api_requests(api_links: list[str]):
+    result = asyncio.run(fetch_all(api_links))
+    return result
 
 async def fetch(command: list[str]) -> dict[str, str | float]:
     while True:
@@ -84,6 +64,32 @@ async def fetch(command: list[str]) -> dict[str, str | float]:
             print("API Limit reached!")
             asyncio.sleep(30)
 
+async def fetch_all(api_links: list[str]) -> list[dict[str, str | float]]:
+    tasks = []
+    for link in api_links:
+        command = ["node", "js_scripts/api_request.js", link]
+        task = asyncio.create_task(fetch(command))
+        tasks.append(task)
+        await asyncio.sleep(0.07)
+    responses = await asyncio.gather(*tasks)
+    return responses
+
+# Clean info from offers
+@task
+def clean(jobs):
+    # result = []
+    # for job in jobs:
+    #     cleaner = Cleaner(job)
+    #     cleaned_job = cleaner.clean_full()
+    #     result.append(cleaned_job)
+    # return result
+    cleaned_result = asyncio.run(clean_all(jobs))
+    return cleaned_result
+
+async def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
+    """Clean the job offer."""
+    cleaner = Cleaner(job)
+    return cleaner.clean_full()
 
 async def clean_all(job_offers: list[dict[str, str | float]]) -> list[dict[str, str | float]]:
     tasks = []
@@ -92,12 +98,6 @@ async def clean_all(job_offers: list[dict[str, str | float]]) -> list[dict[str, 
         tasks.append(task)
     cleaned_offers = await asyncio.gather(*tasks)
     return cleaned_offers
-
-# Clean info from offers
-async def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
-    """Clean the job offer."""
-    cleaner = Cleaner(job)
-    return cleaner.clean_full()
 
 # Insert Data in MongoDB
 @task
@@ -153,12 +153,13 @@ def remove_old_offers(ids_to_del: set[str], collection):
 
 @flow(name="Scrap Job Offers", log_prints=True)
 def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
+    start_time = time.time()
     api_links = run_scraper(job_title, max_pages)
 
-    api_ids = set()
-
     if api_links:
-        result = asyncio.run(fetch_all(api_links))
+        result = api_requests(api_links)
+        cleaned_result = clean(result)
+        api_ids = set([offer["id"] for offer in cleaned_result])
 
     collection = get_db_connection()
     if collection is not None:
@@ -167,9 +168,11 @@ def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
         except UnboundLocalError:
             db_ids = get_all_db_ids(collection)
         db_ids.update(api_ids)
-        insert_data(result, collection)
+        insert_data(cleaned_result, collection)
         ids_to_del = db_ids - api_ids
         remove_old_offers(ids_to_del, collection)
+    end_time = time.time()
+    print(f'Time : {end_time - start_time:.2f}')
 
 if __name__ == "__main__":
     scrap_job_offers(max_pages=1)

@@ -1,6 +1,4 @@
 from prefect import flow, task
-import asyncio
-import aiohttp
 import subprocess
 import json
 from cleaner import Cleaner
@@ -8,6 +6,8 @@ from pymongo import MongoClient, errors
 import os
 import pickle
 from dotenv import load_dotenv
+import asyncio
+import aiohttp
 
 dotenv_path = './mongodb/.env'
 load_dotenv(dotenv_path=dotenv_path)
@@ -37,6 +37,7 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
         output = json.loads(result.stdout)
+        print(f"Scraped {len(output)} offers.")
         return output
     except subprocess.CalledProcessError as e:
         print(f"Error running the script: {e.stderr}")
@@ -44,38 +45,59 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
         print(f"Error decoding JSON: {e}")
 
 # Get info from scraped offers
-async def fetch(session, link):
+# @task
+# def api_request(link: str) -> dict[str, str | float]:
+#     """Get job offer info from API."""
+#     command = ["node", "js_scripts/api_request.js", link]
+
+#     try:
+#         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+#         output = json.loads(result.stdout)
+#         return output
+#     except subprocess.CalledProcessError as e:
+#         print(f"Error running the script: {e.stderr}")
+#     except json.JSONDecodeError as e:
+#         print(f"Error decoding JSON: {e}")
+
+async def fetch_all(api_links: list[str]) -> list[dict[str, str | float]]:
+    tasks = []
+    for link in api_links:
+        command = ["node", "js_scripts/api_request.js", link]
+        task = asyncio.create_task(fetch(command))
+        tasks.append(task)
+        await asyncio.sleep(0.07)
+        responses = await asyncio.gather(*tasks)
+    return responses
+
+
+async def fetch(command: list[str]) -> dict[str, str | float]:
     while True:
         try:
-            async with session.get(link) as response:
-                if response.status == 429:
-                    print('API Limit reached!')
-                    await asyncio.sleep(30)
-                    continue
-                return await response.json()
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+            output = json.loads(result.stdout)
+            return output
+        except subprocess.CalledProcessError as e:
+            print(f"Error running the script: {e.stderr}")
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}")
         except:
-            await asyncio.sleep(30)
+            print("API Limit reached!")
+            asyncio.sleep(30)
 
-async def clean_data(offer_info: dict):
-    cleaner = Cleaner(offer_info)
-    return cleaner.clean_full()
 
-async def fetch_all(api_links: list[str]):
+async def clean_all(job_offers: list[dict[str, str | float]]) -> list[dict[str, str | float]]:
     tasks = []
-    async with aiohttp.ClientSession() as session:
-        for link in api_links:
-            task = asyncio.create_task(fetch(session, link))
-            tasks.append(task)
-            await asyncio.sleep(0.07)
+    for offer in job_offers:
+        task = asyncio.create_task(clean_data(offer))
+        tasks.append(task)
+    cleaned_offers = await asyncio.gather(*tasks)
+    return cleaned_offers
 
-        responses = await asyncio.gather(*tasks)
-
-        cleaned_results = []
-        for response in responses:
-            cleaned_data = await clean_data(response)
-            cleaned_results.append(cleaned_data)
-
-    return cleaned_results
+# Clean info from offers
+async def clean_data(job: dict[str, str | float]) -> dict[str, str | float]:
+    """Clean the job offer."""
+    cleaner = Cleaner(job)
+    return cleaner.clean_full()
 
 # Insert Data in MongoDB
 @task
@@ -84,7 +106,7 @@ def insert_data(data: list[dict[str, str | float]], collection):
         for offer in data:
             existing_id = collection.find_one({'id': offer['id']})
             if existing_id:
-                print(f'ID : "{offer["id"]}" already in db.')
+                print(f'Offer "{offer["id"]}" already in db.')
                 modif_date_db = existing_id['date_modif']
                 modif_date_scrap = offer['date_modif']
                 if modif_date_db < modif_date_scrap:
@@ -129,23 +151,23 @@ def remove_old_offers(ids_to_del: set[str], collection):
     except errors.PyMongoError as e:
         print(f'An error occurred: {e}')
 
-@flow(name="Scrape Job Offers", log_prints=True)
+@flow(name="Scrap Job Offers", log_prints=True)
 def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
     api_links = run_scraper(job_title, max_pages)
 
-    result = asyncio.run(fetch_all(api_links))
+    api_ids = set()
 
-    api_ids = {offer['id'] for offer in result}
-    if db_ids:
-        db_ids += api_ids
-    else:
-        db_ids = get_all_db_ids(collection)
-        db_ids += api_ids
+    if api_links:
+        result = asyncio.run(fetch_all(api_links))
 
     collection = get_db_connection()
-    if collection:
+    if collection is not None:
+        try:
+            db_ids
+        except UnboundLocalError:
+            db_ids = get_all_db_ids(collection)
+        db_ids.update(api_ids)
         insert_data(result, collection)
-        api_ids = {offer['id'] for offer in result}
         ids_to_del = db_ids - api_ids
         remove_old_offers(ids_to_del, collection)
 

@@ -1,5 +1,4 @@
 from prefect import flow, task
-import asyncio
 import subprocess
 import json
 from cleaner import Cleaner
@@ -35,8 +34,8 @@ def run_scraper(job_title: str = "data", max_pages: int = 40) -> list[str]:
 
     try:
         result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
-        print(result.stdout[:10])
         output = json.loads(result.stdout)
+        print(f"Scraped {len(output)} offers.")
         return output
     except subprocess.CalledProcessError as e:
         print(f"Error running the script: {e.stderr}")
@@ -72,7 +71,7 @@ def insert_data(data: list[dict[str, str | float]], collection):
         for offer in data:
             existing_id = collection.find_one({'id': offer['id']})
             if existing_id:
-                print(f'ID : "{offer["id"]}" already in db.')
+                print(f'Offer "{offer["id"]}" already in db.')
                 modif_date_db = existing_id['date_modif']
                 modif_date_scrap = offer['date_modif']
                 if modif_date_db < modif_date_scrap:
@@ -117,36 +116,32 @@ def remove_old_offers(ids_to_del: set[str], collection):
     except errors.PyMongoError as e:
         print(f'An error occurred: {e}')
 
-@flow(
-        name="Scrape Job Offers",
-        log_prints=True,
-        # schedule=IntervalSchedule(interval=timedelta(minutes=30))
-        )
+@flow(name="Scrap Job Offers", log_prints=True)
 def scrap_job_offers(job_title: str = "data", max_pages: int = 40) -> None:
-    api_links = run_scraper(job_title, max_pages).result()
+    api_links = run_scraper(job_title, max_pages)
     result = []
+    api_ids = set()
 
     if api_links:
         for link in api_links:
-            offer_info = api_request(link).result()
+            offer_info = api_request(link)
             if offer_info:
-                cleaned_offer_info = clean_data(offer_info).result()
+                cleaned_offer_info = clean_data(offer_info)
                 result.append(cleaned_offer_info)
+                api_ids.add(cleaned_offer_info['id'])
             else:
                 print(f"Failed to fetch offer details for link: {link}")
-    api_ids = {offer['id'] for offer in result}
-    if db_ids:
-        db_ids += api_ids
-    else:
-        db_ids = get_all_db_ids(collection).result()
-        db_ids += api_ids
 
     collection = get_db_connection()
-    if collection:
+    if collection is not None:
+        try:
+            db_ids
+        except UnboundLocalError:
+            db_ids = get_all_db_ids(collection)
+        db_ids.update(api_ids)
         insert_data(result, collection)
-        api_ids = {offer['id'] for offer in result}
         ids_to_del = db_ids - api_ids
         remove_old_offers(ids_to_del, collection)
 
 if __name__ == "__main__":
-    scrap_job_offers(max_pages=1)
+    scrap_job_offers(max_pages=40)

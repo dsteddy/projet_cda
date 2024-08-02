@@ -20,8 +20,6 @@ async function scrap(jobTitle = "data", maxPage = 40) {
                 await page.goto(url, { waitUntil: "networkidle0" });
                 await page.setViewport({ width: 1080, height: 1024 });
 
-                // await page.waitForSelector('a[backgroundsource]', { timeout: 5000 });
-
                 const links = await page.evaluate(() => {
                     const linkElements = document.querySelectorAll('a');
                     const hrefs = new Set();
